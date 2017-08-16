@@ -4,12 +4,15 @@ from gettext import gettext as _
 from logging import getLogger
 from urllib.parse import urlparse, urlunparse
 
+from django.core.files import File
+from django.db.utils import IntegrityError
 from django.db import models
+from django.db import transaction
 
 from pulpcore.plugin.models import (Artifact, Content, ContentArtifact, DeferredArtifact, Importer,
     ProgressBar, Publisher, RepositoryContent)
 
-from .downloaders import ContentUnitDownloader, DownloadAll
+from .downloaders import ContentUnitDownloader
 
 log = getLogger(__name__)
 
@@ -166,6 +169,9 @@ class ExampleImporter(Importer):
     def deferred_sync(self, delta):
         """
         Synchronize the repository with the remote repository without downloading artifacts.
+
+        Args:
+            delta (namedtuple)
         """
         description = _("Adding file content to the repository without downloading artifacts.")
         progress_bar = ProgressBar(message=description, total=len(delta.additions))
@@ -201,8 +207,6 @@ class ExampleImporter(Importer):
                 # Report progress
                 progress_bar.increment()
 
-
-
     def sync(self):
         """
         Synchronize the repository with the remote repository.
@@ -227,51 +231,105 @@ class ExampleImporter(Importer):
         """
         Synchronize the repository with the remote repository without downloading artifacts.
         """
+        self.content_dict = {}  # keys are unit keys and values are lists of deferred artifacts
+        # associated with the content
         description = _("Dowloading artifacts and adding content to the repository.")
         # Start reporting progress
         progress_bar = ProgressBar(message=description, total=len(delta.additions))
         progress_bar.save()
+        downloader = ContentUnitDownloader(self.next_content_unit(delta.additions))
 
-        download_all = DownloadAll(self)
+        with progress_bar:
+            for id, downloaded_files in downloader:
+                content = self.content_dict.pop(id)
+                self._create_and_associate_content(content, downloaded_files)
+                progress_bar.increment()
+                log.warning('content_unit = {0}'.format(content))
 
+    def next_content_unit(self, additions):
+        """
+        Generator of ExampleContent, ContentArtifacts, and DeferredArtifacts.
+
+        This generator is responsible for creating all the models needed to create ExampleContent in
+        Pulp. It stores the ExampleContent in a dictionary to be used after all the related
+        Artifacts have been downloaded. This generator emits a dictionary with two keys: id and
+        deferred_artifacts. The id is the key that was used to store ExampleContent in
+        self.contetn_dict and the deferred_artifacts is a list of DeferredArtifacts that can be
+        used to download Artifacts for ExampleContent.
+        """
         parsed_url = urlparse(self.feed_url)
         root_dir = os.path.dirname(parsed_url.path)
 
-        for content in delta.additions:
+        for content in additions:
             path = os.path.join(root_dir, content.path)
             url = urlunparse(parsed_url._replace(path=path))
-            content_unit = ExampleContent(path=content.path, digest=content.digest)
-            deferred_artifacts = {content.path: DeferredArtifact(url=url, importer=self,
-                                                      sha256=content.digest)}
-            downloader = ContentUnitDownloader(content_unit, deferred_artifacts)
-            download_all.register_for_downloading(downloader)
-        with progress_bar:
-            for content_unit in download_all:
-                progress_bar.increment()
-                log.warning('content_unit = {0}'.format(content_unit))
+            example_content = ExampleContent(path=content.path, digest=content.digest)
+            content_id = example_content.natural_key()
+            self.content_dict[content_id] = example_content
+            content_artifact = ContentArtifact(content=example_content, relative_path=content.path)
+            deferred_artifacts = [DeferredArtifact(url=url, importer=self, sha256=content.digest,
+                                                   content_artifact=content_artifact)]
+            yield {'id': content_id, 'deferred_artifacts': deferred_artifacts}
 
 
-    @staticmethod
-    def get_checksums(file):
+    def _create_and_associate_content(self, content, deferred_artifacts):
         """
-        Calculates all checksums for a file.
+        Saves ExampleContent and all related models to the database
+
+        This method saves ExampleContent, ContentArtifacts, DeferredArtifacts and Artifacts to
+        the database inside a single transaction.
 
         Args:
-            file (:class:`django.core.files.File`): open file handle
-
-        Returns:
-            dict: Dictionary where keys are checksum names and values are checksum values
+            content (:class:`pulp_example.app.models.ExampleContent`): An instance of
+                ExampleContent to be saved to the database.
+            deferred_artifacts (dict): A dictionary where keys are instances of
+                :class:`pulpcore.plugin.models.DeferredArtifact` and values are dictionaries that
+                contain information about files downloaded using the DeferredArtifacts.
         """
-        hashers = {}
-        for algorithm in hashlib.algorithms_guaranteed:
-            hashers[algorithm] = getattr(hashlib, algorithm)()
-        while True:
-            data = file.read(BUFFER_SIZE)
-            if not data:
-                break
-            for algorithm, hasher in hashers.items():
-                hasher.update(data)
-        ret = {}
-        for algorithm, hasher in hashers.items():
-            ret[algorithm] = hasher.hexdigest()
-        return ret
+
+        # Save Artifacts, ContentArtifacts, DeferredArtifacts, and Content in a transaction
+        with transaction.atomic():
+            # Save content
+            try:
+                with transaction.atomic():
+                    content.save()
+                    log.warning("Created content")
+            except IntegrityError:
+                key = {f.name: getattr(content, f.name) for f in
+                       content.natural_key_fields}
+                content = type(content).objects.get(**key)
+            # Add content to the repository
+            association = RepositoryContent(
+                repository=self.repository,
+                content=content)
+            association.save()
+            log.warning("Created association with repository")
+
+            for deferred_artifact, file_info in deferred_artifacts.items():
+                filename = file_info.pop('filename')
+                with File(open(filename, mode='rb')) as file:
+                    try:
+                        with transaction.atomic():
+                            artifact = Artifact(file=file, size=file.size, **file_info)
+                            artifact.save()
+                    except IntegrityError:
+                        artifact = Artifact.objects.get(sha256=file_info['sha256'])
+
+                content_artifact = deferred_artifact.content_artifact
+                content_artifact.artifact = artifact
+                try:
+                    with transaction.atomic():
+                        content_artifact.save()
+                except IntegrityError:
+                    content_artifact = ContentArtifact.objects.get(
+                        content=content_artifact.content,
+                        relative_path=content_artifact.relative_path)
+                deferred_artifact.content_artifact = content_artifact
+                deferred_artifact.artifact = artifact
+                try:
+                    with transaction.atomic():
+                        deferred_artifact.save()
+                except IntegrityError:
+                    pass
+
+
