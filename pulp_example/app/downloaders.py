@@ -85,10 +85,10 @@ class ContentUnitDownloader(object):
     def __next__(self):
         """
         Returns:
-            tuple: First element is a content identifier and the second element is a dictionary
-            where the keys are :class:`pulpcore.plugin.models.DeferredArtifact` and the values are
-            dictionaries containing information about the downloaded file. The keys of this
-            dictionary are 'filename', 'size', 'sha1' , 'md5', 'sha224',
+            tuple: The first element is a content identifier and the second element is a
+                dictionary where the keys are :class:`pulpcore.plugin.models.DeferredArtifact` and
+                the values are dictionaries containing information about the downloaded file. The
+                keys of this dictionary are 'filename', 'size', 'sha1' , 'md5', 'sha224',
                 'sha256', 'sha384', and 'sha512'.
         """
         if self.first_run:
