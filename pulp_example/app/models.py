@@ -8,6 +8,7 @@ from django.core.files import File
 from django.db.utils import IntegrityError
 from django.db import models
 from django.db import transaction
+from django.db.models import Q
 
 from pulpcore.plugin.models import (Artifact, Content, ContentArtifact, DeferredArtifact, Importer,
     ProgressBar, Publisher, RepositoryContent)
@@ -21,7 +22,7 @@ BUFFER_SIZE = 65536
 # Changes needed.
 Delta = namedtuple('Delta', ('additions', 'removals'))
 # Natural key.
-FileTuple = namedtuple('Key', ('path', 'digest', 'size'))
+FileTuple = namedtuple('Key', ('path', 'digest'))
 
 Line = namedtuple('Line', ('number', 'content'))
 
@@ -88,8 +89,7 @@ class ExampleImporter(Importer):
         q_set = ExampleContent.objects.filter(repositories=self.repository)
         q_set = q_set.only(*[f.name for f in ExampleContent.natural_key_fields])
         for content in (c.cast() for c in q_set):
-            key = FileTuple(path=content.path, digest=content.digest,
-                            size=content.contentartifact_set.all()[0].artifact.size)
+            key = FileTuple(path=content.path, digest=content.digest)
             inventory.add(key)
         return inventory
 
@@ -148,16 +148,12 @@ class ExampleImporter(Importer):
         """
         inventory = self._fetch_inventory()
         parsed_url = urlparse(self.feed_url)
-        # Start asyncio event loop
-
-
-        parsed_url = urlparse(self.feed_url)
         download = self.get_download(self.feed_url, os.path.basename(parsed_url.path))
         download()
         self.path = download.writer.path
         remote = set()
         for entry in self.read():
-            key = FileTuple(path=entry['path'], digest=entry['digest'], size=entry['size'])
+            key = FileTuple(path=entry['path'], digest=entry['digest'])
             remote.add(key)
         additions = remote - inventory
         if mirror:
@@ -212,6 +208,34 @@ class ExampleImporter(Importer):
         Synchronize the repository with the remote repository.
         """
         delta = self._find_delta()
+
+        # Find content that is already in Pulp
+        fields = {f.name for f in ExampleContent.natural_key_fields}
+
+        q = Q()
+        for c in delta.additions:
+            q |= Q(path=c.path, digest=c.digest)
+
+        # Find all content being added that already exists in Pulp and has all of it's Artifacts
+        # downloaded. Associate with the repository.
+        ready_to_associate = ExampleContent.objects.filter(q).filter(contentartifact__artifact__isnull=False)
+        with ProgressBar(message="Associating units already in Pulp",
+                         total=ready_to_associate.count()) as bar:
+            for content in ready_to_associate:
+                association = RepositoryContent(
+                    repository=self.repository,
+                    content=content)
+                association.save()
+                bar.increment()
+                # Remove it from the delta
+                key = FileTuple(path=content.path, digest=content.digest)
+                delta.additions.remove(key)
+
+        # Find all content being added that already exists in Pulp but needs 1+ Artifacts to be
+        # downloaded.
+        content_missing_artifacts = ExampleContent.objects.filter(q).filter(contentartifact__artifact=None)
+
+
         if self.download_policy != self.IMMEDIATE:
             self.deferred_sync(delta)
         else:
