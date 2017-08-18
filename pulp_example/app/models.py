@@ -87,6 +87,8 @@ class ExampleImporter(Importer):
         """
         inventory = set()
         q_set = ExampleContent.objects.filter(repositories=self.repository)
+        if self.download_policy == self.IMMEDIATE:
+            q_set = q_set.filter(contentartifact__artifact__isnull=False)
         q_set = q_set.only(*[f.name for f in ExampleContent.natural_key_fields])
         for content in (c.cast() for c in q_set):
             key = FileTuple(path=content.path, digest=content.digest)
@@ -162,79 +164,28 @@ class ExampleImporter(Importer):
             removals = set()
         return Delta(additions=additions, removals=removals)
 
-    def deferred_sync(self, delta):
-        """
-        Synchronize the repository with the remote repository without downloading artifacts.
-
-        Args:
-            delta (namedtuple)
-        """
-        description = _("Adding file content to the repository without downloading artifacts.")
-        progress_bar = ProgressBar(message=description, total=len(delta.additions))
-
-        parsed_url = urlparse(self.feed_url)
-        root_dir = os.path.dirname(parsed_url.path)
-
-        with progress_bar:
-            for entry in delta.additions:
-                path = os.path.join(root_dir, entry.path)
-                url = urlunparse(parsed_url._replace(path=path))
-                content, content_created = ExampleContent.objects.get_or_create(path=entry.path,
-                                                                             digest=entry.digest)
-                # Add content to the repository
-                association = RepositoryContent(
-                    repository=self.repository,
-                    content=content)
-                association.save()
-                # ContentArtifact is required for all download policies. It is used for publishing.
-                content_artifact, content_artifact_created = ContentArtifact.objects.get_or_create(
-                    content=content, relative_path=entry.path)
-                # DeferredArtifact is required for deferred download policies.
-                deferred_artifact, deferred_artifact_created = \
-                    DeferredArtifact.objects.get_or_create(
-                    url=url, importer=self, content_artifact=content_artifact, sha256=entry.digest)
-
-                try:
-                    artifact = Artifact.objects.get(sha256=entry.digest)
-                    content_artifact.artifact = artifact
-                except Artifact.DoesNotExist:
-                    pass
-                content_artifact.save()
-                # Report progress
-                progress_bar.increment()
-
     def sync(self):
         """
         Synchronize the repository with the remote repository.
         """
+        self.content_dict = {}  # keys are unit keys and values are lists of deferred artifacts
+        # associated with the content
         delta = self._find_delta()
 
-        # Find content that is already in Pulp
+        # Find all content being added that already exists in Pulp and associate with repository.
         fields = {f.name for f in ExampleContent.natural_key_fields}
-
         q = Q()
         for c in delta.additions:
             q |= Q(path=c.path, digest=c.digest)
-
-        # Find all content being added that already exists in Pulp and has all of it's Artifacts
-        # downloaded. Associate with the repository.
-        ready_to_associate = ExampleContent.objects.filter(q).filter(contentartifact__artifact__isnull=False)
-        with ProgressBar(message="Associating units already in Pulp",
-                         total=ready_to_associate.count()) as bar:
-            for content in ready_to_associate:
-                association = RepositoryContent(
-                    repository=self.repository,
-                    content=content)
-                association.save()
-                bar.increment()
-                # Remove it from the delta
-                key = FileTuple(path=content.path, digest=content.digest)
-                delta.additions.remove(key)
-
-        # Find all content being added that already exists in Pulp but needs 1+ Artifacts to be
-        # downloaded.
-        content_missing_artifacts = ExampleContent.objects.filter(q).filter(contentartifact__artifact=None)
-
+        if self.download_policy == self.IMMEDIATE:
+            # Filter out any content that still needs to have artifacts downloaded
+            ready_to_associate = ExampleContent.objects.filter(q).filter(
+                contentartifact__artifact__isnull=False).only(*fields)
+        else:
+            ready_to_associate = ExampleContent.objects.filter(q).only(*fields)
+        added = self.associate_existing_content(ready_to_associate)
+        remaining_additions = delta.additions - added
+        delta = Delta(additions=remaining_additions, removals=delta.removals)
 
         if self.download_policy != self.IMMEDIATE:
             self.deferred_sync(delta)
@@ -251,23 +202,62 @@ class ExampleImporter(Importer):
             RepositoryContent.objects.filter(
                 repository=self.repository).filter(content=q_set).delete()
 
+    def associate_existing_content(self, content_q):
+        """
+        Associates existing content to the importer's repository
+        
+        Args:
+            content_q (queryset): Queryset that will return content that needs to be associated
+                with the importer's repository.
+
+        Returns:
+            Set of natural keys representing each piece of content associated with the repository.
+        """
+        added = set()
+        with ProgressBar(message="Associating units already in Pulp with the repository",
+                         total=content_q.count()) as bar:
+            for content in content_q:
+                association = RepositoryContent(
+                    repository=self.repository,
+                    content=content)
+                association.save()
+                bar.increment()
+                # Remove it from the delta
+                key = FileTuple(path=content.path, digest=content.digest)
+                added.add(key)
+        return added
+
+    def deferred_sync(self, delta):
+        """
+        Synchronize the repository with the remote repository without downloading artifacts.
+
+        Args:
+            delta (namedtuple)
+        """
+        description = _("Adding file content to the repository without downloading artifacts.")
+        progress_bar = ProgressBar(message=description, total=len(delta.additions))
+
+        with progress_bar:
+            for item in self.next_content_unit(delta.additions):
+                content = self.content_dict[item['id']]
+                deferred_artifacts = {}
+                for deferred_artifact in item['deferred_artifacts']:
+                    deferred_artifacts[deferred_artifact] = None
+                self._create_and_associate_content(content, deferred_artifacts)
+                progress_bar.increment()
+
     def full_sync(self, delta):
         """
         Synchronize the repository with the remote repository without downloading artifacts.
         """
-        self.content_dict = {}  # keys are unit keys and values are lists of deferred artifacts
-        # associated with the content
         description = _("Dowloading artifacts and adding content to the repository.")
-        # Start reporting progress
-        progress_bar = ProgressBar(message=description, total=len(delta.additions))
-        progress_bar.save()
         downloader = ContentUnitDownloader(self.next_content_unit(delta.additions))
 
-        with progress_bar:
+        with ProgressBar(message=description, total=len(delta.additions)) as bar:
             for id, downloaded_files in downloader:
                 content = self.content_dict.pop(id)
                 self._create_and_associate_content(content, downloaded_files)
-                progress_bar.increment()
+                bar.increment()
                 log.warning('content_unit = {0}'.format(content))
 
     def next_content_unit(self, additions):
@@ -290,11 +280,12 @@ class ExampleImporter(Importer):
             example_content = ExampleContent(path=content.path, digest=content.digest)
             content_id = example_content.natural_key()
             self.content_dict[content_id] = example_content
-            content_artifact = ContentArtifact(content=example_content, relative_path=content.path)
+            # The content is set on the content_artifact right before writing to the
+            # database. This helps deal with race conditions when saving Content.
+            content_artifact = ContentArtifact(relative_path=content.path)
             deferred_artifacts = [DeferredArtifact(url=url, importer=self, sha256=content.digest,
                                                    content_artifact=content_artifact)]
             yield {'id': content_id, 'deferred_artifacts': deferred_artifacts}
-
 
     def _create_and_associate_content(self, content, deferred_artifacts):
         """
@@ -330,17 +321,27 @@ class ExampleImporter(Importer):
             log.warning("Created association with repository")
 
             for deferred_artifact, file_info in deferred_artifacts.items():
-                filename = file_info.pop('filename')
-                with File(open(filename, mode='rb')) as file:
+                if file_info:
+                    # Create artifact that was downloaded and deal with race condition
+                    filename = file_info.pop('filename')
+                    with File(open(filename, mode='rb')) as file:
+                        try:
+                            with transaction.atomic():
+                                artifact = Artifact(file=file, size=file.size, **file_info)
+                                artifact.save()
+                        except IntegrityError:
+                            artifact = Artifact.objects.get(sha256=file_info['sha256'])
+                else:
+                    # Try to find an artifact if one already exists
                     try:
                         with transaction.atomic():
-                            artifact = Artifact(file=file, size=file.size, **file_info)
-                            artifact.save()
-                    except IntegrityError:
-                        artifact = Artifact.objects.get(sha256=file_info['sha256'])
-
+                            # try to find an artifact from information in deferred artifact
+                            artifact = Artifact.objects.get(sha256=deferred_artifact.sha256)
+                    except Artifact.DoesNotExist:
+                        artifact = None
                 content_artifact = deferred_artifact.content_artifact
                 content_artifact.artifact = artifact
+                content_artifact.content = content
                 try:
                     with transaction.atomic():
                         content_artifact.save()
