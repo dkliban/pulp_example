@@ -7,46 +7,20 @@ import os
 from collections import defaultdict
 from logging import getLogger
 
-
-
-from pulpcore.plugin.models import (Artifact, Content, ContentArtifact, DeferredArtifact, Importer,
-    ProgressBar, RepositoryContent)
-
+from pulpcore.download.http import ConcurrentHttpDownloader
+from pulpcore.plugin.download import Factory
 
 log = getLogger(__name__)
 
 
-async def ConcurrentHttpDownloader(url, timeout=10):
-    async with aiohttp.ClientSession() as session:
-        algorithms = {n: hashlib.new(n) for n in Artifact.DIGEST_FIELDS}
-        attributes = {}
-        with async_timeout.timeout(timeout):
-            async with session.get(url) as response:
-                filename = os.path.basename(url)
-                with open(filename, 'wb') as f_handle:
-                    while True:
-                        chunk = await response.content.read(1024)
-                        if not chunk:
-                            print('Finished downloading {filename}'.format(filename=filename))
-                            break
-                        f_handle.write(chunk)
-                        for algorithm in algorithms.values():
-                            algorithm.update(chunk)
-                        # push each chunk through the digest and size validators
-            await response.release()
-            attributes.update({n: a.hexdigest() for n, a in algorithms.items()})
-            attributes['filename'] = filename
-            return url, attributes
-
-
-
 class ContentUnitDownloader(object):
 
-    def __init__(self, content_to_download):
+    def __init__(self, content_to_download, importer):
         """
         Args:
             content_to_download (iterable): An iterable of tuples (id, [DeferredArtifact])
         """
+        self.importer = importer
         self.content_to_download = content_to_download
         self.downloads_not_done = set()
         self.content_units_not_done = []
@@ -68,7 +42,8 @@ class ContentUnitDownloader(object):
         for url in content_unit.urls:
             if len(self.urls[url]) == 0:
                 # This is the first time we've seen this url so make a downloader
-                downloader_for_url = ConcurrentHttpDownloader(url)
+
+                downloader_for_url = Factory(self.importer).build(url, None)
                 self.downloads_not_done.add(downloader_for_url)
             self.urls[url].append(content_unit)
 

@@ -1,3 +1,4 @@
+import asyncio
 import os
 from collections import namedtuple
 from gettext import gettext as _
@@ -151,8 +152,11 @@ class ExampleImporter(Importer):
         inventory = self._fetch_inventory()
         parsed_url = urlparse(self.feed_url)
         download = self.get_download(self.feed_url, os.path.basename(parsed_url.path))
-        download()
-        self.path = download.writer.path
+        loop = asyncio.get_event_loop()
+        done_this_time, downloads_not_done = loop.run_until_complete(asyncio.wait([download]))
+        for task in done_this_time:
+            url, attributes = task.result()
+            self.path = attributes['filename']
         remote = set()
         for entry in self.read():
             key = FileTuple(path=entry['path'], digest=entry['digest'])
@@ -251,7 +255,7 @@ class ExampleImporter(Importer):
         Synchronize the repository with the remote repository without downloading artifacts.
         """
         description = _("Dowloading artifacts and adding content to the repository.")
-        downloader = ContentUnitDownloader(self.next_content_unit(delta.additions))
+        downloader = ContentUnitDownloader(self.next_content_unit(delta.additions), self)
 
         with ProgressBar(message=description, total=len(delta.additions)) as bar:
             for id, downloaded_files in downloader:
