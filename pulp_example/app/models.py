@@ -28,6 +28,36 @@ FileTuple = namedtuple('Key', ('path', 'digest'))
 Line = namedtuple('Line', ('number', 'content'))
 
 
+class ExampleContentManager(models.Manager):
+    """
+    A custom manager for all models that inherit from Content.
+
+    The ContentManager can be used to find existing content in Pulp. This is useful when trying
+    to determine whether content needs to be downloaded or not.
+    """
+    def find_by_unit_key(self, unit_keys, partial=False):
+        """
+        Returns a queryset built from the unit keys.
+
+        Args:
+            unit_keys (Iterable): An iterable of dictionaries where each key is a member of
+                Content._meta.unique_together.
+            partial (bool): Designates whether or not Content with missing artifacts should be
+                included in the QuerySet.
+
+        Returns:
+            QuerySet of Content that corresponds to the unit keys passed in. When 'partial' is
+                True, the QuerySet includes Content that is missing Artifacts.
+        """
+        q = models.Q()
+        for key in unit_keys:
+            q |= models.Q(**key)
+        if partial:
+            return super().get_queryset().filter(q)
+        else:
+            return super().get_queryset().filter(q).filter(
+                contentartifact__artifact__isnull=False)
+
 class ExampleContent(Content):
     """
     The "example" content type.
@@ -44,14 +74,19 @@ class ExampleContent(Content):
 
     path = models.TextField(blank=False, null=False)
     digest = models.TextField(blank=False, null=False)
-
-    natural_key_fields = (path, digest)
+    objects = ExampleContentManager()
 
     class Meta:
         unique_together = (
             'path',
             'digest'
         )
+
+    @classmethod
+    def unit_key_fields(cls):
+        for unique in cls._meta.unique_together:
+            for field in unique:
+                yield field
 
 
 class ExamplePublisher(Publisher):
@@ -90,9 +125,9 @@ class ExampleImporter(Importer):
         q_set = ExampleContent.objects.filter(repositories=self.repository)
         if self.download_policy == self.IMMEDIATE:
             q_set = q_set.filter(contentartifact__artifact__isnull=False)
-        q_set = q_set.only(*[f.name for f in ExampleContent.natural_key_fields])
+        q_set = q_set.only(*[field for field in ExampleContent.unit_key_fields()])
         for content in (c.cast() for c in q_set):
-            key = FileTuple(path=content.path, digest=content.digest)
+            key = {'path': content.path, 'digest': content.digest}
             inventory.add(key)
         return inventory
 
@@ -118,14 +153,14 @@ class ExampleImporter(Importer):
                     n=line.number))
         return {'path': part[0], 'digest': part[1], 'size': int(part[2])}
 
-    def read(self):
+    def read_manifest(self):
         """
         Read the file at `path` and yield entries.
 
         Yields:
             Entry: for each line.
         """
-        with open(self.path) as fp:
+        with open(self.manifest_path) as fp:
             n = 0
             for line in fp.readlines():
                 n += 1
@@ -151,15 +186,15 @@ class ExampleImporter(Importer):
         """
         inventory = self._fetch_inventory()
         parsed_url = urlparse(self.feed_url)
-        download = self.get_download(self.feed_url, os.path.basename(parsed_url.path))
+        download = self.get_downloader(self.feed_url, os.path.basename(parsed_url.path))
         loop = asyncio.get_event_loop()
         done_this_time, downloads_not_done = loop.run_until_complete(asyncio.wait([download]))
         for task in done_this_time:
-            url, attributes = task.result()
-            self.path = attributes['filename']
+            download_result = task.result()
+            self.manifest_path = download_result.path
         remote = set()
-        for entry in self.read():
-            key = FileTuple(path=entry['path'], digest=entry['digest'])
+        for entry in self.read_manifest():
+            key = {'path': entry['path'], 'digest': entry['digest']}
             remote.add(key)
         additions = remote - inventory
         if mirror:
@@ -178,15 +213,13 @@ class ExampleImporter(Importer):
 
         # Find all content being added that already exists in Pulp and associate with repository.
         fields = {f.name for f in ExampleContent.natural_key_fields}
-        q = Q()
-        for c in delta.additions:
-            q |= Q(path=c.path, digest=c.digest)
         if self.download_policy == self.IMMEDIATE:
             # Filter out any content that still needs to have artifacts downloaded
-            ready_to_associate = ExampleContent.objects.filter(q).filter(
-                contentartifact__artifact__isnull=False).only(*fields)
+            ready_to_associate = ExampleContent.objects.find_by_unit_key(delta.additions).only(*fields)
         else:
-            ready_to_associate = ExampleContent.objects.filter(q).only(*fields)
+            ready_to_associate = ExampleContent.objects.find_by_unit_key(delta.additions,
+                                                                         partial=True
+                                                                         ).only(*fields)
         added = self.associate_existing_content(ready_to_associate)
         remaining_additions = delta.additions - added
         delta = Delta(additions=remaining_additions, removals=delta.removals)
@@ -201,7 +234,8 @@ class ExampleImporter(Importer):
             # Build a query that uniquely identifies all content that needs to be removed.
             q = models.Q()
             for key in delta.removals:
-                q |= models.Q(examplecontent__path=key.path, examplecontent__digest=key.digest)
+                q |= models.Q(examplecontent__path=key['path'],
+                              examplecontent__digest=key['digest'])
             q_set = self.repository.content.filter(q)
             RepositoryContent.objects.filter(
                 repository=self.repository).filter(content=q_set).delete()
@@ -277,19 +311,23 @@ class ExampleImporter(Importer):
         """
         parsed_url = urlparse(self.feed_url)
         root_dir = os.path.dirname(parsed_url.path)
-
-        for content in additions:
-            path = os.path.join(root_dir, content.path)
-            url = urlunparse(parsed_url._replace(path=path))
-            example_content = ExampleContent(path=content.path, digest=content.digest)
-            content_id = example_content.natural_key()
-            self.content_dict[content_id] = example_content
-            # The content is set on the content_artifact right before writing to the
-            # database. This helps deal with race conditions when saving Content.
-            content_artifact = ContentArtifact(relative_path=content.path)
-            deferred_artifacts = [DeferredArtifact(url=url, importer=self, sha256=content.digest,
-                                                   content_artifact=content_artifact)]
-            yield {'id': content_id, 'deferred_artifacts': deferred_artifacts}
+        for entry in self.read_manifest():
+            key = {'path': entry['path'], 'digest': entry['digest']}
+            if key in additions:
+                path = os.path.join(root_dir, entry['path'])
+                url = urlunparse(parsed_url._replace(path=path))
+                example_content = ExampleContent(path=entry['path'], digest=entry['digest'])
+                content_id = example_content.natural_key()
+                self.content_dict[content_id] = example_content
+                # The content is set on the content_artifact right before writing to the
+                # database. This helps deal with race conditions when saving Content.
+                content_artifact = ContentArtifact(relative_path=entry['path'])
+                deferred_artifacts = [DeferredArtifact(url=url,
+                                                       importer=self,
+                                                       sha256=entry['digest'],
+                                                       size=entry['size'],
+                                                       content_artifact=content_artifact)]
+                yield {'id': content_id, 'deferred_artifacts': deferred_artifacts}
 
     def _create_and_associate_content(self, content, deferred_artifacts):
         """

@@ -7,8 +7,7 @@ import os
 from collections import defaultdict
 from logging import getLogger
 
-from pulpcore.download.http import ConcurrentHttpDownloader
-from pulpcore.plugin.download import Factory
+from pulpcore.plugin.download import DownloadFactory
 
 log = getLogger(__name__)
 
@@ -43,7 +42,7 @@ class ContentUnitDownloader(object):
             if len(self.urls[url]) == 0:
                 # This is the first time we've seen this url so make a downloader
 
-                downloader_for_url = Factory(self.importer).build(url, None)
+                downloader_for_url = DownloadFactory(self.importer).build(url, None)
                 self.downloads_not_done.add(downloader_for_url)
             self.urls[url].append(content_unit)
 
