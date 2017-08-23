@@ -14,7 +14,8 @@ from django.db.models import Q
 from pulpcore.plugin.models import (Artifact, Content, ContentArtifact, DeferredArtifact, Importer,
     ProgressBar, Publisher, RepositoryContent)
 
-from .downloaders import ContentUnitDownloader
+from pulpcore.plugin.download import GroupDownloader
+
 
 log = getLogger(__name__)
 
@@ -23,7 +24,7 @@ BUFFER_SIZE = 65536
 # Changes needed.
 Delta = namedtuple('Delta', ('additions', 'removals'))
 # Natural key.
-FileTuple = namedtuple('Key', ('path', 'digest'))
+Key = namedtuple('Key', ('path', 'digest'))
 
 Line = namedtuple('Line', ('number', 'content'))
 
@@ -51,7 +52,10 @@ class ExampleContentManager(models.Manager):
         """
         q = models.Q()
         for key in unit_keys:
-            q |= models.Q(**key)
+            unit_key_dict = {}
+            for field in ExampleContent.unit_key_fields():
+                unit_key_dict[field] = getattr(key, field)
+            q |= models.Q(**unit_key_dict)
         if partial:
             return super().get_queryset().filter(q)
         else:
@@ -127,7 +131,7 @@ class ExampleImporter(Importer):
             q_set = q_set.filter(contentartifact__artifact__isnull=False)
         q_set = q_set.only(*[field for field in ExampleContent.unit_key_fields()])
         for content in (c.cast() for c in q_set):
-            key = {'path': content.path, 'digest': content.digest}
+            key = Key(path=content.path, digest=content.digest)
             inventory.add(key)
         return inventory
 
@@ -186,7 +190,7 @@ class ExampleImporter(Importer):
         """
         inventory = self._fetch_inventory()
         parsed_url = urlparse(self.feed_url)
-        download = self.get_downloader(self.feed_url, os.path.basename(parsed_url.path))
+        download = self.get_downloader(self.feed_url)
         loop = asyncio.get_event_loop()
         done_this_time, downloads_not_done = loop.run_until_complete(asyncio.wait([download]))
         for task in done_this_time:
@@ -194,7 +198,7 @@ class ExampleImporter(Importer):
             self.manifest_path = download_result.path
         remote = set()
         for entry in self.read_manifest():
-            key = {'path': entry['path'], 'digest': entry['digest']}
+            key = Key(path=entry['path'], digest=entry['digest'])
             remote.add(key)
         additions = remote - inventory
         if mirror:
@@ -212,7 +216,7 @@ class ExampleImporter(Importer):
         delta = self._find_delta()
 
         # Find all content being added that already exists in Pulp and associate with repository.
-        fields = {f.name for f in ExampleContent.natural_key_fields}
+        fields = {f for f in ExampleContent.unit_key_fields()}
         if self.download_policy == self.IMMEDIATE:
             # Filter out any content that still needs to have artifacts downloaded
             ready_to_associate = ExampleContent.objects.find_by_unit_key(delta.additions).only(*fields)
@@ -261,7 +265,7 @@ class ExampleImporter(Importer):
                 association.save()
                 bar.increment()
                 # Remove it from the delta
-                key = FileTuple(path=content.path, digest=content.digest)
+                key = Key(path=content.path, digest=content.digest)
                 added.add(key)
         return added
 
@@ -289,12 +293,13 @@ class ExampleImporter(Importer):
         Synchronize the repository with the remote repository without downloading artifacts.
         """
         description = _("Dowloading artifacts and adding content to the repository.")
-        downloader = ContentUnitDownloader(self.next_content_unit(delta.additions), self)
+        downloader = GroupDownloader(self)
+        downloader.schedule_from_iterator(self.next_content_unit(delta.additions))
 
         with ProgressBar(message=description, total=len(delta.additions)) as bar:
-            for id, downloaded_files in downloader:
-                content = self.content_dict.pop(id)
-                self._create_and_associate_content(content, downloaded_files)
+            for group_id, downloaded_dict in downloader:
+                content = self.content_dict.pop(group_id)
+                self._create_and_associate_content(content, downloaded_dict)
                 bar.increment()
                 log.warning('content_unit = {0}'.format(content))
 
@@ -312,12 +317,12 @@ class ExampleImporter(Importer):
         parsed_url = urlparse(self.feed_url)
         root_dir = os.path.dirname(parsed_url.path)
         for entry in self.read_manifest():
-            key = {'path': entry['path'], 'digest': entry['digest']}
+            key = Key(path=entry['path'], digest=entry['digest'])
             if key in additions:
                 path = os.path.join(root_dir, entry['path'])
                 url = urlunparse(parsed_url._replace(path=path))
                 example_content = ExampleContent(path=entry['path'], digest=entry['digest'])
-                content_id = example_content.natural_key()
+                content_id = tuple(getattr(example_content, f) for f in example_content.unit_key_fields())
                 self.content_dict[content_id] = example_content
                 # The content is set on the content_artifact right before writing to the
                 # database. This helps deal with race conditions when saving Content.
@@ -329,7 +334,7 @@ class ExampleImporter(Importer):
                                                        content_artifact=content_artifact)]
                 yield {'id': content_id, 'deferred_artifacts': deferred_artifacts}
 
-    def _create_and_associate_content(self, content, deferred_artifacts):
+    def _create_and_associate_content(self, content, group_result):
         """
         Saves ExampleContent and all related models to the database
 
@@ -352,8 +357,8 @@ class ExampleImporter(Importer):
                     content.save()
                     log.warning("Created content")
             except IntegrityError:
-                key = {f.name: getattr(content, f.name) for f in
-                       content.natural_key_fields}
+                key = {f: getattr(content, f) for f in
+                       content.unit_key_fields()}
                 content = type(content).objects.get(**key)
             # Add content to the repository
             association = RepositoryContent(
@@ -362,17 +367,17 @@ class ExampleImporter(Importer):
             association.save()
             log.warning("Created association with repository")
 
-            for deferred_artifact, file_info in deferred_artifacts.items():
-                if file_info:
+            for deferred_artifact, download_result in group_result.items():
+                if download_result:
                     # Create artifact that was downloaded and deal with race condition
-                    filename = file_info.pop('filename')
-                    with File(open(filename, mode='rb')) as file:
+                    with File(open(download_result.path, mode='rb')) as file:
                         try:
                             with transaction.atomic():
-                                artifact = Artifact(file=file, size=file.size, **file_info)
+                                artifact = Artifact(file=file,
+                                                    **download_result.artifact_attributes)
                                 artifact.save()
                         except IntegrityError:
-                            artifact = Artifact.objects.get(sha256=file_info['sha256'])
+                            artifact = Artifact.objects.get(sha256=download_result.artifact_attributes['sha256'])
                 else:
                     # Try to find an artifact if one already exists
                     try:
