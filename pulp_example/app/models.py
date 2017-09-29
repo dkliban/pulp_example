@@ -16,6 +16,7 @@ from pulpcore.plugin.models import (Artifact, Content, ContentArtifact, RemoteAr
                                     PublishedMetadata)
 from pulpcore.plugin.tasking import Task
 from pulpcore.plugin.download.asyncio import Group, GroupDownloader
+from pulpcore.plugin.download.file import DownloadedFile
 from pulpcore.plugin.download.futures import Batch, DownloadError
 from pulpcore.plugin.download.futures.tools import DownloadMonitor
 
@@ -490,7 +491,7 @@ class ExampleFuturesImporter(Importer):
                 if download_result:
                     # Create artifact that was downloaded and deal with race condition
                     path = download_result.pop('path')
-                    with File(open(path, mode='rb')) as file:
+                    with DownloadedFile(open(path, mode='rb')) as file:
                         try:
                             with transaction.atomic():
                                 artifact = Artifact(file=file,
@@ -791,7 +792,7 @@ class ExampleAsyncIOImporter(Importer):
             for url in group.urls:
                 if group.downloaded_files:
                     # Create artifact that was downloaded and deal with race condition
-                    with File(open(group.downloaded_files[url].path, mode='rb')) as file:
+                    with DownloadedFile(open(group.downloaded_files[url].path, mode='rb')) as file:
                         try:
                             with transaction.atomic():
                                 artifact = Artifact(file=file,
